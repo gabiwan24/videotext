@@ -84,8 +84,7 @@
         let physicsLetters = [];
         let worker;
 
-        // NEU: Variablen für den Kamerawechsel und Mobile-Erkennung
-        let currentFacingMode = 'environment'; // Startet mit der Rückkamera
+        let currentFacingMode = 'environment';
         const isMobile = /Mobi|Android/i.test(navigator.userAgent);
 
         let engine;
@@ -117,22 +116,13 @@
             setInterval(performRecognition, 1500);
         }
 
-        // GEÄNDERT: Startet die Kamera mit optimierten Constraints für mobile Geräte
         function startCapture() {
-            let videoOptions = {};
+            let videoOptions = {
+                width: { ideal: 640 },
+                height: { ideal: 480 }
+            };
             if (isMobile) {
                 videoOptions.facingMode = { exact: currentFacingMode };
-                // Fordert ein passendes Seitenverhältnis an
-                if (window.innerHeight > window.innerWidth) { // Hochformat
-                    videoOptions.width = { ideal: 480 };
-                    videoOptions.height = { ideal: 640 };
-                } else { // Querformat
-                    videoOptions.width = { ideal: 640 };
-                    videoOptions.height = { ideal: 480 };
-                }
-            } else {
-                 videoOptions.width = 640;
-                 videoOptions.height = 480;
             }
 
             capture = createCapture({ video: videoOptions }, () => {
@@ -161,12 +151,11 @@
             world = engine.world;
             engine.world.gravity.y = 0;
 
-            // Blendet den Kamera-Wechsel-Button nur auf mobilen Geräten ein
             if (isMobile) {
                 switchCamButton.classList.remove('hidden');
             }
             
-            startCapture(); // Erster Kamerastart
+            startCapture();
 
             visibilitySlider.addEventListener('input', (e) => {
                 const visibility = parseInt(e.target.value);
@@ -186,30 +175,10 @@
             });
         }
         
-        // GEÄNDERT: Passt das Layout für Hochformat-Vollbild an
+        // KORRIGIERT: Die Layout-Berechnung wurde vereinfacht und ist jetzt robuster.
         function calculateLayout() {
             if (!capture || capture.width === 0) return;
 
-            // Im Hochformat auf mobilen Geräten -> Vollbild
-            if (isMobile && height > width) {
-                const videoRatio = capture.height / capture.width; // Hochformat-Ratio
-                const windowRatio = height / width;
-
-                if (windowRatio > videoRatio) {
-                    drawW = width;
-                    drawH = width * videoRatio;
-                    drawX = 0;
-                    drawY = (height - drawH) / 2;
-                } else {
-                    drawH = height;
-                    drawW = height / videoRatio;
-                    drawY = 0;
-                    drawX = (width - drawW) / 2;
-                }
-                return;
-            }
-
-            // Standard-Logik für Querformat und Desktop
             const videoRatio = capture.width / capture.height;
             const windowRatio = width / height;
 
@@ -285,10 +254,9 @@
             scanIndicator.classList.remove('hidden');
             scanIndicator.classList.add('blinking');
             
-            const ocrGraphics = createGraphics(capture.width, capture.height);
-            ocrGraphics.image(capture, 0, 0, capture.width, capture.height);
-            ocrGraphics.filter(THRESHOLD);
-            const imageData = ocrGraphics.elt.toDataURL();
+            // KORRIGIERT: Der aggressive THRESHOLD-Filter wurde entfernt.
+            // Tesseract erhält jetzt das direkte, unveränderte Kamerabild.
+            const imageData = capture.elt;
 
             try {
                 const { data } = await worker.recognize(imageData);
