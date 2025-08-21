@@ -1,0 +1,539 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
+  <title>Kamera‑Texterkennung (optimiert)</title>
+  <!-- Tailwind CSS -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <!-- p5.js -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.9.0/p5.js"></script>
+  <!-- Tesseract.js -->
+  <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+  <!-- Matter.js -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/matter-js/0.19.0/matter.min.js"></script>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background-color: #111827;
+    }
+    #canvas-container {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+    }
+    @keyframes blink { 50% { opacity: 0.5; } }
+    .blinking { animation: blink 1s linear infinite; }
+  </style>
+</head>
+<body class="bg-gray-900 text-gray-200 font-sans">
+  <div id="canvas-container"></div>
+
+  <div class="absolute bottom-4 left-4 flex items-end gap-4">
+    <button id="switch-cam-button" class="hidden bg-gray-700 hover:bg-gray-600 text-white p-2 rounded-full transition-colors" title="Kamera wechseln">
+      <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 19H4a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h5"/><path d="M14 5h7a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2h-5"/><path d="m17 12-3-3 3-3"/><path d="m7 12 3 3-3 3"/></svg>
+    </button>
+    <div class="flex flex-col gap-3 w-48">
+      <div>
+        <label for="visibility-slider" class="block text-xs font-medium text-white/70">Sichtbarkeit Video: <span id="visibility-value" class="font-bold">10</span>%</label>
+        <input id="visibility-slider" type="range" min="0" max="100" value="10" class="w-full h-1.5 bg-gray-700 rounded-lg appearance-none cursor-pointer" />
+      </div>
+      <div>
+        <label for="confidence-slider" class="block text-xs font-medium text-white/70">Genauigkeitsschwelle: <span id="confidence-value" class="font-bold">50</span>%</label>
+        <input id="confidence-slider" type="range" min="0" max="100" value="50" class="w-full h-1.5 bg-gray-700 rounded-lg appearance-none cursor-pointer" />
+      </div>
+    </div>
+  </div>
+
+  <div class="absolute bottom-4 right-4">
+    <div id="scan-indicator" class="w-3 h-3 bg-red-500 rounded-full hidden"></div>
+  </div>
+
+  <div id="status-overlay" class="absolute inset-0 flex justify-center items-center pointer-events-none">
+    <div class="bg-gray-900/70 backdrop-blur-sm p-4 rounded-xl shadow-lg">
+      <p id="status-text" class="text-white text-center">Initialisiere Kamera...</p>
+    </div>
+  </div>
+
+  <script>
+    // Matter.js Module
+    const { Engine, World, Bodies, Body, Composite } = Matter;
+
+    // ====== Konfigurationen & Konstanten ======
+    const MAX_BODIES = 80;                // Budget: weniger Physik-Objekte -> bessere FPS
+    const LORES_W = 512;                  // Breite für schnelle ROI-Erkennung
+    const THUMB_W = 160;                  // Breite für Stabilitätsprüfung
+    const BLOCK_SIZE = 16;                // ROI-Erkennung: Zellgröße
+    const MERGE_MARGIN = 8;               // ROI-Merging in Low-Res-Pixeln
+
+    const OCR_MIN_WORD_PIXELS = 24 * 8;   // Filtere winzige ROIs (Low-Res-Pixel)
+
+    let capture, p5Canvas;
+    let videoReady = false;
+    let isRecognizing = false;
+    let worker;
+
+    let drawX = 0, drawY = 0, drawW = 0, drawH = 0; // Video-Zeichenbereich am Canvas
+
+    let engine, world;
+    let gravityOn = false;
+
+    let backgroundAlpha = 230;
+    let confidenceThreshold = 50;
+
+    const recentDetections = []; // für De-Dup (letzte ~2s)
+
+    // Wort-Objekte: { text, w, h, body, sprite, addedAt }
+    const physicsWords = [];
+
+    const isMobile = /Mobi|Android/i.test(navigator.userAgent);
+    let currentFacingMode = 'environment';
+
+    // Offscreen-Canvas für OCR / Low-Res-Analysen (wiederverwendet)
+    let ocrCanvas, ocrCtx;
+    let lowresCanvas, lowresCtx;
+    let thumbCanvas, thumbCtx, lastThumbData;
+
+    // UI Elemente
+    const statusText = document.getElementById('status-text');
+    const statusOverlay = document.getElementById('status-overlay');
+    const scanIndicator = document.getElementById('scan-indicator');
+    const visibilitySlider = document.getElementById('visibility-slider');
+    const visibilityValue = document.getElementById('visibility-value');
+    const confidenceSlider = document.getElementById('confidence-slider');
+    const confidenceValue = document.getElementById('confidence-value');
+    const switchCamButton = document.getElementById('switch-cam-button');
+
+    function ensureCanvas(ref, w, h) {
+      if (!ref.canvas || ref.canvas.width !== w || ref.canvas.height !== h) {
+        ref.canvas = document.createElement('canvas');
+        ref.canvas.width = w; ref.canvas.height = h;
+        ref.ctx = ref.canvas.getContext('2d', { willReadFrequently: true });
+      }
+    }
+
+    function ensureOCRCanvas(w, h) {
+      if (!ocrCanvas || ocrCanvas.width !== w || ocrCanvas.height !== h) {
+        ocrCanvas = document.createElement('canvas');
+        ocrCanvas.width = w; ocrCanvas.height = h;
+        ocrCtx = ocrCanvas.getContext('2d', { willReadFrequently: true });
+      }
+    }
+
+    function ensureLowresCanvas(w, h) {
+      if (!lowresCanvas || lowresCanvas.width !== w || lowresCanvas.height !== h) {
+        lowresCanvas = document.createElement('canvas');
+        lowresCanvas.width = w; lowresCanvas.height = h;
+        lowresCtx = lowresCanvas.getContext('2d', { willReadFrequently: true });
+      }
+    }
+
+    function ensureThumbCanvas(w, h) {
+      if (!thumbCanvas || thumbCanvas.width !== w || thumbCanvas.height !== h) {
+        thumbCanvas = document.createElement('canvas');
+        thumbCanvas.width = w; thumbCanvas.height = h;
+        thumbCtx = thumbCanvas.getContext('2d', { willReadFrequently: true });
+      }
+    }
+
+    // ====== Tesseract Initialisierung (SIMD/optimiert) ======
+    async function initializeTesseract() {
+      if (!videoReady) { setTimeout(initializeTesseract, 100); return; }
+      statusText.textContent = 'Initialisiere Texterkennung...';
+
+      worker = await Tesseract.createWorker({
+        logger: m => console.debug(m),
+        corePath: 'https://cdn.jsdelivr.net/npm/tesseract.js-core@5/wasm/tesseract-core.wasm.js',
+        workerPath: 'https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/worker.min.js',
+        langPath: 'https://tessdata.projectnaptha.com/5'
+      });
+      await worker.loadLanguage('deu');
+      await worker.initialize('deu');
+      await worker.setParameters({
+        tessedit_pageseg_mode: '11',            // Sparse Text
+        preserve_interword_spaces: '1',
+        // Großzügiger Zeichensatz (Deutsch + Ziffern + gängige Satzzeichen)
+        tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZÄÖÜabcdefghijklmnopqrstuvwxyzäöüß0123456789.,:;!?' + "()[]%€+/#\"'–-"
+      });
+
+      statusText.textContent = 'Bereit. Halte Text vor die Kamera.';
+      setTimeout(() => { statusOverlay.style.display = 'none'; }, 1200);
+
+      // Erkennungs-Loop: häufig prüfen, OCR nur bei Stabilität
+      setInterval(recognitionLoop, 300);
+    }
+
+    // ====== Kamera Handling ======
+    function stopCapture() {
+      try { capture?.elt?.srcObject?.getTracks()?.forEach(t => t.stop()); } catch {}
+      try { capture?.remove(); } catch {}
+    }
+
+    function startCapture() {
+      const videoConstraints = {
+        width: { ideal: 1280 },
+        height: { ideal: 720 },
+        facingMode: { ideal: isMobile ? currentFacingMode : 'user' }
+      };
+
+      capture = createCapture({ video: videoConstraints }, () => {
+        if (!videoReady) {
+          videoReady = true;
+          statusText.textContent = 'Kamera bereit.';
+          calculateLayout();
+          initializeTesseract();
+        } else {
+          calculateLayout();
+          resetWorld();
+        }
+      });
+      capture.hide();
+    }
+
+    // ====== p5 Setup / Draw ======
+    function setup() {
+      const container = document.getElementById('canvas-container');
+      p5Canvas = createCanvas(windowWidth, windowHeight);
+      p5Canvas.parent(container);
+      pixelDensity(1);
+
+      engine = Engine.create({ enableSleeping: true });
+      world = engine.world;
+      world.gravity.y = 0; // keine Gravitation bis Trigger
+
+      if (isMobile) switchCamButton.classList.remove('hidden');
+
+      startCapture();
+
+      visibilitySlider.addEventListener('input', e => {
+        const v = parseInt(e.target.value, 10); visibilityValue.textContent = v;
+        backgroundAlpha = map(v, 0, 100, 255, 0);
+      });
+      confidenceSlider.addEventListener('input', e => {
+        confidenceThreshold = parseInt(e.target.value, 10); confidenceValue.textContent = confidenceThreshold;
+      });
+      switchCamButton.addEventListener('click', () => {
+        currentFacingMode = (currentFacingMode === 'environment') ? 'user' : 'environment';
+        stopCapture();
+        startCapture();
+      });
+    }
+
+    function draw() {
+      background(0);
+      if (videoReady) image(capture, drawX, drawY, drawW, drawH);
+      background(0, backgroundAlpha);
+
+      // Engine nur updaten, wenn nötig
+      const bodies = Composite.allBodies(world);
+      const anyAwake = bodies.some(b => !b.isSleeping);
+      if (anyAwake || gravityOn) Engine.update(engine, 1000/60);
+
+      // Render Wort-Sprites
+      imageMode(CENTER);
+      for (let i = physicsWords.length - 1; i >= 0; i--) {
+        const w = physicsWords[i];
+        if (!w.body) { physicsWords.splice(i,1); continue; }
+        const pos = w.body.position;
+        const ang = w.body.angle;
+        if (pos.y > height + 60 || pos.y < -60 || pos.x < -60 || pos.x > width + 60) {
+          Composite.remove(world, w.body); physicsWords.splice(i,1); continue;
+        }
+        push();
+        translate(pos.x, pos.y); rotate(ang);
+        image(w.sprite, 0, 0, w.w, w.h);
+        pop();
+      }
+    }
+
+    function windowResized() {
+      resizeCanvas(windowWidth, windowHeight);
+      calculateLayout();
+      resetWorld();
+    }
+
+    function keyPressed() { if (keyCode === ENTER) triggerFall(); }
+
+    function resetWorld() {
+      World.clear(world);
+      physicsWords.length = 0;
+      world.gravity.y = 0;
+      gravityOn = false;
+    }
+
+    // ====== Layout / Mapping ======
+    function calculateLayout() {
+      if (!capture || capture.width === 0) return;
+      const videoRatio = capture.width / capture.height;
+      const windowRatio = width / height;
+      if (windowRatio > videoRatio) {
+        drawH = height; drawW = height * videoRatio; drawX = (width - drawW) / 2; drawY = 0;
+      } else {
+        drawW = width; drawH = width / videoRatio; drawX = 0; drawY = (height - drawH) / 2;
+      }
+    }
+
+    function videoToCanvasX(x) { return drawX + (x / capture.width) * drawW; }
+    function videoToCanvasY(y) { return drawY + (y / capture.height) * drawH; }
+    function videoToCanvasW(wv) { return (wv / capture.width) * drawW; }
+    function videoToCanvasH(hv) { return (hv / capture.height) * drawH; }
+
+    // ====== Stabilitätsprüfung (Motion Gate) ======
+    function isStable(threshold = 6) {
+      if (!videoReady) return false;
+      const aspect = capture.height / capture.width;
+      const w = THUMB_W; const h = Math.max(1, Math.round(w * aspect));
+      ensureThumbCanvas(w, h);
+      thumbCtx.drawImage(capture.elt, 0, 0, w, h);
+      const img = thumbCtx.getImageData(0, 0, w, h);
+      const data = img.data;
+      // einfache Luma nur im Rot-Kanal speichern (um Schleifen zu sparen)
+      for (let i = 0; i < data.length; i += 4) {
+        const r = data[i], g = data[i+1], b = data[i+2];
+        const y = 0.2126*r + 0.7152*g + 0.0722*b;
+        data[i] = y; // R-Kanal als Luma
+      }
+      let diff = 0, n = w*h;
+      if (!lastThumbData) {
+        lastThumbData = new Uint8ClampedArray(data); return false;
+      }
+      for (let i = 0; i < n; i++) diff += Math.abs(data[i*4] - lastThumbData[i*4]);
+      lastThumbData.set(data);
+      return (diff / n) < threshold;
+    }
+
+    // ====== ROI-Erkennung in Low-Res ======
+    function detectROIsQuick() {
+      const aspect = capture.height / capture.width;
+      const w = LORES_W; const h = Math.max(1, Math.round(w * aspect));
+      ensureLowresCanvas(w, h);
+      lowresCtx.drawImage(capture.elt, 0, 0, w, h);
+      const { data } = lowresCtx.getImageData(0, 0, w, h);
+
+      // Luma-Array
+      const luma = new Uint8Array(w*h);
+      for (let i = 0, p = 0; i < data.length; i += 4, p++) {
+        luma[p] = 0.2126*data[i] + 0.7152*data[i+1] + 0.0722*data[i+2];
+      }
+
+      // Gradient-Energie pro Block
+      const bw = Math.floor(w / BLOCK_SIZE);
+      const bh = Math.floor(h / BLOCK_SIZE);
+      const energy = new Float32Array(bw*bh);
+      for (let by = 0; by < bh; by++) {
+        for (let bx = 0; bx < bw; bx++) {
+          let sum = 0;
+          const x0 = bx * BLOCK_SIZE;
+          const y0 = by * BLOCK_SIZE;
+          for (let y = 0; y < BLOCK_SIZE; y++) {
+            const yy = y0 + y; const row = yy * w;
+            for (let x = 0; x < BLOCK_SIZE; x++) {
+              const xx = x0 + x;
+              const idx = row + xx;
+              const gx = Math.abs(luma[idx] - luma[Math.min(row + xx + 1, row + Math.min(xx+1, w-1))]);
+              const gy = Math.abs(luma[idx] - luma[Math.min((yy+1)*w + xx, ((h-1)*w + xx))]);
+              sum += gx + gy;
+            }
+          }
+          energy[by*bw + bx] = sum / (BLOCK_SIZE*BLOCK_SIZE);
+        }
+      }
+
+      // adaptiver Schwellwert: Median * Faktor
+      const tmp = Array.from(energy);
+      tmp.sort((a,b)=>a-b);
+      const median = tmp[Math.floor(tmp.length/2)] || 0;
+      const thresh = Math.max(10, median * 1.6);
+
+      // markierte Blöcke -> Rechtecke
+      const rects = [];
+      for (let by = 0; by < bh; by++) {
+        for (let bx = 0; bx < bw; bx++) {
+          if (energy[by*bw + bx] >= thresh) {
+            rects.push({ x: bx*BLOCK_SIZE, y: by*BLOCK_SIZE, w: BLOCK_SIZE, h: BLOCK_SIZE });
+          }
+        }
+      }
+      if (!rects.length) return [];
+
+      // Merge überlappender/naher Zellen in Low-Res-Pixeln
+      let merged = true;
+      while (merged) {
+        merged = false;
+        for (let i = 0; i < rects.length; i++) {
+          for (let j = i+1; j < rects.length; j++) {
+            if (rectsOverlapOrClose(rects[i], rects[j], MERGE_MARGIN)) {
+              rects[i] = mergeRects(rects[i], rects[j]);
+              rects.splice(j,1); merged = true; j--; // erneut prüfen
+            }
+          }
+        }
+      }
+
+      // Filtere kleine Flächen
+      const minArea = OCR_MIN_WORD_PIXELS;
+      const big = rects.filter(r => (r.w * r.h) >= minArea);
+
+      // Map Low-Res -> Video-Pixel
+      const scaleV = capture.width / w; // gleiche Skala für x & y, da aspect fix
+      return big.map(r => ({
+        x: Math.max(0, Math.floor(r.x * scaleV)),
+        y: Math.max(0, Math.floor(r.y * scaleV * aspect)), // y skaliert mit Höhe
+        w: Math.min(capture.width - Math.floor(r.x * scaleV), Math.ceil(r.w * scaleV)),
+        h: Math.min(capture.height - Math.floor(r.y * scaleV * aspect), Math.ceil(r.h * scaleV * aspect))
+      }));
+    }
+
+    function rectsOverlapOrClose(a, b, m) {
+      return !(a.x - m > b.x + b.w + m || a.x + a.w + m < b.x - m || a.y - m > b.y + b.h + m || a.y + a.h + m < b.y - m);
+    }
+    function mergeRects(a, b) {
+      const x = Math.min(a.x, b.x), y = Math.min(a.y, b.y);
+      const x2 = Math.max(a.x + a.w, b.x + b.w), y2 = Math.max(a.y + a.h, b.y + b.h);
+      return { x, y, w: x2 - x, h: y2 - y };
+    }
+
+    // ====== OCR-Loop ======
+    async function recognitionLoop() {
+      if (!videoReady || !worker || isRecognizing) return;
+      if (!isStable()) return; // nur bei ruhigem Bild
+
+      isRecognizing = true;
+      scanIndicator.classList.remove('hidden');
+      scanIndicator.classList.add('blinking');
+      try {
+        const rois = detectROIsQuick();
+        for (const roi of rois) {
+          await recognizeROIAndPlace(roi);
+        }
+      } catch (e) { console.error(e); }
+      finally {
+        isRecognizing = false;
+        scanIndicator.classList.add('hidden');
+        scanIndicator.classList.remove('blinking');
+      }
+    }
+
+    async function recognizeROIAndPlace(roi) {
+      // ROI in Original-Videoauflösung -> ImageData
+      ensureOCRCanvas(roi.w, roi.h);
+      ocrCtx.drawImage(capture.elt, roi.x, roi.y, roi.w, roi.h, 0, 0, roi.w, roi.h);
+      const imageData = ocrCtx.getImageData(0, 0, roi.w, roi.h);
+
+      const { data } = await worker.recognize(imageData);
+      if (!data?.words?.length) return;
+
+      const now = performance.now();
+      for (const word of data.words) {
+        const textRaw = (word.text || '').trim();
+        if (!textRaw) continue;
+        if (word.confidence < confidenceThreshold) continue;
+
+        // Optionaler Textfilter (breit):
+        const text = textRaw.replace(/\s+/g, ' ');
+        if (text.length < 2) continue;
+
+        // BBox: OCR-Koordinaten (ROI) -> Video -> Canvas
+        const { x0, y0, x1, y1 } = word.bbox;
+        const vx0 = roi.x + x0, vy0 = roi.y + y0, vx1 = roi.x + x1, vy1 = roi.y + y1;
+
+        // De-Dup: gleiche Stelle & Text in den letzten 1500ms
+        if (isDuplicateDetection({ x: vx0, y: vy0, w: vx1 - vx0, h: vy1 - vy0 }, text, now)) continue;
+        recentDetections.push({ rect: { x: vx0, y: vy0, w: vx1 - vx0, h: vy1 - vy0 }, text, time: now, conf: word.confidence });
+        // prune alt
+        for (let i = recentDetections.length - 1; i >= 0; i--) if (now - recentDetections[i].time > 2000) recentDetections.splice(i,1);
+
+        addWordBody(text, vx0, vy0, vx1, vy1);
+
+        // Easter Egg: RESET -> Fall auslösen
+        if (text.toUpperCase() === 'RESET') triggerFall();
+      }
+
+      // Budget halten
+      trimBodiesToBudget();
+    }
+
+    function iou(a, b) {
+      const ax2 = a.x + a.w, ay2 = a.y + a.h;
+      const bx2 = b.x + b.w, by2 = b.y + b.h;
+      const xI = Math.max(0, Math.min(ax2, bx2) - Math.max(a.x, b.x));
+      const yI = Math.max(0, Math.min(ay2, by2) - Math.max(a.y, b.y));
+      const inter = xI * yI; if (!inter) return 0;
+      const union = a.w*a.h + b.w*b.h - inter; return inter / union;
+    }
+    function isDuplicateDetection(rect, text, now) {
+      for (const r of recentDetections) {
+        if (now - r.time > 1500) continue;
+        if (r.text === text && iou(rect, r.rect) > 0.5) return true;
+      }
+      return false;
+    }
+
+    // ====== Physik-Wörter (ein Body pro Wort + Sprite) ======
+    function makeWordSprite(text, w, h) {
+      // p5-Buffer für das Wort (einmalig zeichnen)
+      const g = createGraphics(Math.max(1, Math.ceil(w)), Math.max(1, Math.ceil(h)));
+      g.pixelDensity(1);
+      g.background(0, 0);
+      g.noStroke(); g.fill(255);
+      g.textAlign(CENTER, CENTER);
+      g.textSize(h * 0.8);
+      g.textFont('Arial');
+      g.text(text, w/2, h/2 + 0.5);
+      return g; // später via image() gerendert
+    }
+
+    function addWordBody(text, vx0, vy0, vx1, vy1) {
+      // Video -> Canvas Maße
+      const cx = videoToCanvasX((vx0 + vx1) / 2);
+      const cy = videoToCanvasY((vy0 + vy1) / 2);
+      const cw = Math.max(8, videoToCanvasW(vx1 - vx0));
+      const ch = Math.max(8, videoToCanvasH(vy1 - vy0));
+
+      // Abstand prüfen (vermeide extremes Überlappen neuer Wörter)
+      for (const w of physicsWords) {
+        const dx = w.body.position.x - cx, dy = w.body.position.y - cy;
+        const dist2 = dx*dx + dy*dy;
+        if (dist2 < 25*25) return; // zu nahe -> überspringen
+      }
+
+      const density = map(ch, 10, 100, 0.001, 0.005, true);
+      const body = Bodies.rectangle(cx, cy, cw, ch, {
+        isStatic: true,
+        restitution: 0.5,
+        friction: 0.1,
+        density
+      });
+
+      const sprite = makeWordSprite(text, cw, ch);
+      physicsWords.push({ text, w: cw, h: ch, body, sprite, addedAt: performance.now() });
+      World.add(world, body);
+    }
+
+    function trimBodiesToBudget() {
+      while (physicsWords.length > MAX_BODIES) {
+        const w = physicsWords.shift();
+        if (w?.body) Composite.remove(world, w.body);
+      }
+    }
+
+    function triggerFall() {
+      if (!physicsWords.length) return;
+      world.gravity.y = 1; gravityOn = true;
+      for (const w of physicsWords) {
+        Body.setStatic(w.body, false);
+        Body.applyForce(w.body, w.body.position, { x: (Math.random()-0.5)*0.004, y: 0.012 });
+      }
+    }
+
+    // ====== GO! ======
+    // p5 ruft setup()/draw() automatisch
+  </script>
+</body>
+</html>
