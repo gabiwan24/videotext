@@ -1,7 +1,8 @@
+<!DOCTYPE html>
+<html lang="de">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-    <title>Kamera-Texterkennung (Echtzeit-Overlay)</title>
     <title>Kamera-Texterkennung</title>
     <!-- Tailwind CSS für das Styling -->
     <script src="https://cdn.tailwindcss.com"></script>
@@ -14,21 +15,25 @@
     <style>
         html, body {
             margin: 0;
-@@ -29,85 +31,99 @@
+            padding: 0;
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            background-color: #111827;
+        }
+        #canvas-container {
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            display: flex;
             justify-content: center;
             align-items: center;
         }
-        .ui-overlay {
-            position: absolute;
-            bottom: 0;
-            left: 0;
-            right: 0;
-            pointer-events: none; 
         @keyframes blink {
             50% { opacity: 0.5; }
         }
-        .ui-element {
-            pointer-events: auto;
         .blinking {
             animation: blink 1s linear infinite;
         }
@@ -38,29 +43,19 @@
 
     <div id="canvas-container"></div>
 
-    <div class="ui-overlay p-4 sm:p-6 flex justify-center items-end">
-        <div class="ui-element w-full max-w-xl bg-gray-900/70 backdrop-blur-sm p-4 rounded-xl shadow-lg">
-              <div class="flex flex-col items-center justify-center gap-4">
-                   <!-- Slider für die Sichtbarkeit des Videobilds -->
-                  <div class="w-full">
-                      <label for="visibility-slider" class="block text-sm font-medium mb-2 text-center text-white">Sichtbarkeit Video: <span id="visibility-value" class="font-bold">10</span>%</label>
-                      <input id="visibility-slider" type="range" min="0" max="100" value="10" class="w-full h-2 bg-gray-700 rounded-lg appearance-none cursor-pointer">
-                  </div>
-                  <div id="status-container" class="w-full h-8 text-center text-sm text-gray-300">
-                      <p id="status-text">Initialisiere Kamera...</p>
-                      <div id="progress-bar-container" class="w-full bg-gray-700 rounded-full h-2.5 mt-1 hidden">
-                          <div id="progress-bar" class="bg-indigo-500 h-2.5 rounded-full" style="width: 0%"></div>
-                      </div>
-                  </div>
-              </div>
-    <div class="absolute bottom-4 left-4 flex flex-col gap-3 w-48">
-        <div>
-            <label for="visibility-slider" class="block text-xs font-medium text-white/70">Sichtbarkeit Video: <span id="visibility-value" class="font-bold">10</span>%</label>
-            <input id="visibility-slider" type="range" min="0" max="100" value="10" class="w-full h-1.5 bg-gray-700 rounded-lg appearance-none cursor-pointer">
-        </div>
-        <div>
-            <label for="confidence-slider" class="block text-xs font-medium text-white/70">Genauigkeitsschwelle: <span id="confidence-value" class="font-bold">50</span>%</label>
-            <input id="confidence-slider" type="range" min="0" max="100" value="50" class="w-full h-1.5 bg-gray-700 rounded-lg appearance-none cursor-pointer">
+    <div class="absolute bottom-4 left-4 flex items-end gap-4">
+        <button id="switch-cam-button" class="hidden bg-gray-700 hover:bg-gray-600 text-white p-2 rounded-full transition-colors">
+            <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 19H4a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h5"/><path d="M14 5h7a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2h-5"/><path d="m17 12-3-3 3-3"/><path d="m7 12 3 3-3 3"/></svg>
+        </button>
+        <div class="flex flex-col gap-3 w-48">
+            <div>
+                <label for="visibility-slider" class="block text-xs font-medium text-white/70">Sichtbarkeit Video: <span id="visibility-value" class="font-bold">10</span>%</label>
+                <input id="visibility-slider" type="range" min="0" max="100" value="10" class="w-full h-1.5 bg-gray-700 rounded-lg appearance-none cursor-pointer">
+            </div>
+            <div>
+                <label for="confidence-slider" class="block text-xs font-medium text-white/70">Genauigkeitsschwelle: <span id="confidence-value" class="font-bold">50</span>%</label>
+                <input id="confidence-slider" type="range" min="0" max="100" value="50" class="w-full h-1.5 bg-gray-700 rounded-lg appearance-none cursor-pointer">
+            </div>
         </div>
     </div>
     
@@ -83,33 +78,31 @@
         let p5Canvas;
         let videoReady = false;
         let isRecognizing = false;
-
-        // NEU: Variablen für das responsive Layout
+        
         let drawX, drawY, drawW, drawH;
-
-        let recognizedWords = [];
+        
         let physicsLetters = [];
         let worker;
 
-        // Physik-Welt
+        let currentFacingMode = 'environment';
+        const isMobile = /Mobi|Android/i.test(navigator.userAgent);
+
         let engine;
         let world;
-
-        let backgroundAlpha = 230; // Entspricht 10% Sichtbarkeit
+        
         let backgroundAlpha = 230;
         let confidenceThreshold = 50;
         const OVERLAP_TOLERANCE = 20;
 
         // UI Elemente
         const statusText = document.getElementById('status-text');
-        const progressBarContainer = document.getElementById('progress-bar-container');
-        const progressBar = document.getElementById('progress-bar');
         const statusOverlay = document.getElementById('status-overlay');
         const scanIndicator = document.getElementById('scan-indicator');
         const visibilitySlider = document.getElementById('visibility-slider');
         const visibilityValue = document.getElementById('visibility-value');
         const confidenceSlider = document.getElementById('confidence-slider');
         const confidenceValue = document.getElementById('confidence-value');
+        const switchCamButton = document.getElementById('switch-cam-button');
 
         async function initializeTesseract() {
             if (!videoReady) {
@@ -117,38 +110,55 @@
                 return;
             }
             statusText.textContent = "Initialisiere Texterkennung...";
-            worker = await Tesseract.createWorker('deu', 1, {
-                logger: updateStatus,
-            });
             worker = await Tesseract.createWorker('deu', 1);
             statusText.textContent = "Bereit. Halte Text vor die Kamera.";
             setTimeout(() => { statusOverlay.style.display = 'none'; }, 2000);
             setInterval(performRecognition, 1500);
         }
 
+        function startCapture() {
+            let videoOptions = {
+                width: { ideal: 640 },
+                height: { ideal: 480 }
+            };
+            if (isMobile) {
+                videoOptions.facingMode = { exact: currentFacingMode };
+            }
+
+            capture = createCapture({ video: videoOptions }, () => {
+                if (!videoReady) {
+                    videoReady = true;
+                    statusText.textContent = "Kamera bereit.";
+                    calculateLayout();
+                    initializeTesseract();
+                } else {
+                    calculateLayout();
+                    World.clear(world);
+                    physicsLetters = []; 
+                    engine.world.gravity.y = 0;
+                }
+            });
+            capture.hide();
+        }
+
         function setup() {
             const canvasContainer = document.getElementById('canvas-container');
-            // GEÄNDERT: Canvas füllt jetzt das ganze Fenster
             p5Canvas = createCanvas(windowWidth, windowHeight);
             p5Canvas.parent('canvas-container');
             pixelDensity(1);
-
+            
             engine = Engine.create();
             world = engine.world;
             engine.world.gravity.y = 0;
 
-            capture = createCapture(VIDEO, () => {
-                videoReady = true;
-                statusText.textContent = "Kamera bereit.";
-                // NEU: Layout nach dem Start der Kamera berechnen
-                calculateLayout();
-                initializeTesseract();
-            });
-            // Fordert eine Standardauflösung an, die dann skaliert wird
-            capture.size(640, 480);
-            capture.hide();
+            if (isMobile) {
+                switchCamButton.classList.remove('hidden');
+            }
+            
+            startCapture();
 
-@@ -116,9 +132,13 @@
+            visibilitySlider.addEventListener('input', (e) => {
+                const visibility = parseInt(e.target.value);
                 visibilityValue.textContent = visibility;
                 backgroundAlpha = map(visibility, 0, 100, 255, 0);
             });
@@ -157,40 +167,42 @@
                 confidenceThreshold = parseInt(e.target.value);
                 confidenceValue.textContent = confidenceThreshold;
             });
-        }
 
-        // NEU: Funktion zur Berechnung des responsiven Layouts
+            switchCamButton.addEventListener('click', () => {
+                currentFacingMode = (currentFacingMode === 'environment') ? 'user' : 'environment';
+                capture.remove();
+                startCapture();
+            });
+        }
+        
         function calculateLayout() {
             if (!capture || capture.width === 0) return;
+
             const videoRatio = capture.width / capture.height;
-@@ -138,93 +158,157 @@
+            const windowRatio = width / height;
+
+            if (windowRatio > videoRatio) {
+                drawH = height;
+                drawW = height * videoRatio;
+                drawX = (width - drawW) / 2;
+                drawY = 0;
+            } else {
+                drawW = width;
+                drawH = width / videoRatio;
+                drawX = 0;
+                drawY = (height - drawH) / 2;
+            }
         }
 
         function draw() {
-            // Zuerst einen komplett schwarzen Hintergrund zeichnen
             background(0);
 
             if(videoReady) {
-                // GEÄNDERT: Das Kamerabild wird jetzt ungespiegelt und responsiv gezeichnet
                 image(capture, drawX, drawY, drawW, drawH);
             }
 
-            // Dann den halbtransparenten schwarzen Hintergrund darüber legen
             background(0, backgroundAlpha);
 
-            if (recognizedWords.length > 0) {
-                for (const word of recognizedWords) {
-                    // GEÄNDERT: Die Position wird jetzt auf das responsive Layout umgerechnet
-                    const displayX = map(word.x, 0, capture.width, drawX, drawX + drawW);
-                    const displayY = map(word.y, 0, capture.height, drawY, drawY + drawH);
-                    const displayH = map(word.h, 0, capture.height, 0, drawH);
-                    
-                    fill(255);
-                    noStroke();
-                    textFont('Arial');
-                    textAlign(LEFT, TOP);
-                    textSize(displayH * 0.8);
-                    text(word.text, displayX, displayY);
             Engine.update(engine);
 
             for (let i = physicsLetters.length - 1; i >= 0; i--) {
@@ -198,7 +210,7 @@
                 const pos = letter.body.position;
                 const angle = letter.body.angle;
 
-                if (pos.y > height + 50) {
+                if (pos.y > height + 50 || pos.y < -50 || pos.x < -50 || pos.x > width + 50) {
                     Composite.remove(world, letter.body);
                     physicsLetters.splice(i, 1);
                     continue;
@@ -216,15 +228,6 @@
                 pop();
             }
         }
-        
-        function updateStatus(message) {
-            statusText.textContent = message.status;
-            if (message.status === 'recognizing text') {
-                progressBarContainer.classList.remove('hidden');
-                const progress = (message.progress * 100).toFixed(2);
-                progressBar.style.width = `${progress}%`;
-            } else {
-                 progressBarContainer.classList.add('hidden');
 
         function triggerFall() {
             if (physicsLetters.length === 0) return;
@@ -249,20 +252,18 @@
             isRecognizing = true;
             scanIndicator.classList.remove('hidden');
             scanIndicator.classList.add('blinking');
-
-            // Die Analyse erfolgt weiterhin auf dem Originalbild der Kamera
-            const imageData = capture.canvas.toDataURL();
+            
+            // KORRIGIERT: Erstellt einen sauberen Schnappschuss auf einem temporären Canvas,
+            // anstatt das Live-Videoelement direkt zu übergeben. Dies behebt den Fetch-Fehler.
             const ocrGraphics = createGraphics(capture.width, capture.height);
             ocrGraphics.image(capture, 0, 0, capture.width, capture.height);
-            ocrGraphics.filter(THRESHOLD);
             const imageData = ocrGraphics.elt.toDataURL();
+
 
             try {
                 const { data } = await worker.recognize(imageData);
-                const newWords = [];
                 
                 for (const word of data.words) {
-                    if (word.confidence > 60 && word.text.length > 3) {
                     const wordText = word.text.trim();
                     const cleanWord = wordText.replace(/[^a-zA-ZäöüÄÖÜß]/g, '');
                     const hasVowel = /[aeiouäöü]/i.test(cleanWord);
@@ -271,17 +272,9 @@
                         const { x0, y0, x1, y1 } = word.bbox;
                         const w = x1 - x0;
                         const h = y1 - y0;
-                        
-                        newWords.push({
-                            text: word.text,
-                            x: x0,
-                            y: y0,
-                            w: w,
-                            h: h,
-                        });
 
                         const letterWidth = w / wordText.length;
-                        let lastLetterRightEdge = null; // Verfolgt die rechte Kante des letzten Buchstabens im Wort
+                        let lastLetterRightEdge = null;
 
                         for (let i = 0; i < wordText.length; i++) {
                             const letterText = wordText[i];
@@ -292,7 +285,6 @@
                             const displayW = map(letterWidth, 0, capture.width, 0, drawW);
                             const displayH = map(h, 0, capture.height, 0, drawH);
                             
-                            // NEU: Kerning-Logik, um Überlappung innerhalb eines Wortes zu verhindern
                             if (lastLetterRightEdge !== null && (displayX - displayW / 2 < lastLetterRightEdge)) {
                                 displayX = lastLetterRightEdge + displayW / 2;
                             }
@@ -307,8 +299,7 @@
                                 }
                             }
                             if (isTooClose) {
-                                // Bricht die Verarbeitung des gesamten Wortes ab, wenn ein Buchstabe zu nah ist
-                                lastLetterRightEdge = null; // Reset für das nächste Wort
+                                lastLetterRightEdge = null;
                                 break;
                             }
 
@@ -329,7 +320,6 @@
                             });
                             World.add(world, body);
                             
-                            // Aktualisiert die Position der rechten Kante für den nächsten Buchstaben
                             lastLetterRightEdge = displayX + displayW / 2;
                         }
 
@@ -338,28 +328,19 @@
                         }
                     }
                 }
-                
-                recognizedWords = recognizedWords.concat(newWords);
-
-                statusText.textContent = ` ${recognizedWords.length} Wörter insgesamt gefunden. Scanne erneut...`;
 
             } catch (error) {
                 console.error(error);
-                statusText.textContent = "Ein Fehler ist aufgetreten.";
             } finally {
                 isRecognizing = false;
-                progressBarContainer.classList.add('hidden');
                 scanIndicator.classList.add('hidden');
                 scanIndicator.classList.remove('blinking');
             }
         }
 
-        // GEÄNDERT: Funktion zur Anpassung bei Fenstergrößenänderung
         function windowResized() {
             resizeCanvas(windowWidth, windowHeight);
             calculateLayout();
-            // Optional: Erkannte Wörter löschen, da ihre Positionen nicht mehr stimmen
-            recognizedWords = []; 
             World.clear(world);
             physicsLetters = []; 
             engine.world.gravity.y = 0;
